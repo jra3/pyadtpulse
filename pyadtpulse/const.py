@@ -12,7 +12,6 @@ ADT_LOGOUT_URI = "/access/signout.jsp"
 ADT_MFA_FAIL_URI = "/mfa/mfaSignIn.jsp?workflow=challenge"
 
 ADT_SUMMARY_URI = "/summary/summary.jsp"
-ADT_ZONES_URI = "/ajax/homeViewDevAjax.jsp"
 ADT_ORB_URI = "/ajax/orb.jsp"
 ADT_SYSTEM_URI = "/system/system.jsp"
 ADT_DEVICE_URI = "/system/device.jsp"
