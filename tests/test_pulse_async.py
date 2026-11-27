@@ -283,6 +283,34 @@ def make_sync_check_pattern(get_mocked_url):
     return re.compile(rf"{re.escape(get_mocked_url(ADT_SYNC_CHECK_URI))}/?.*$")
 
 
+@pytest.mark.parametrize(
+    ("response_text", "last_value", "expected"),
+    [
+        # First poll after login establishes a baseline, no update signalled.
+        ("1-0-0", None, False),
+        ("61494-0-0", None, False),
+        # Unchanged token means no updates, regardless of counter magnitude.
+        ("1-0-0", "1-0-0", False),
+        ("61494-0-0", "61494-0-0", False),
+        # A changed token signals updates.
+        ("2-0-0", "1-0-0", True),
+        # Regression: a large, changing counter must still be detected as an
+        # update. The previous magnitude-based heuristic treated any token with
+        # a leading field > 9 as "no updates", silently missing these.
+        ("61495-0-0", "61494-0-0", True),
+        ("100-0-0", "99-0-0", True),
+    ],
+)
+def test_sync_check_response_has_update(
+    response_text: str, last_value: str | None, expected: bool
+):
+    """Sync-check updates are detected by token change, not field magnitude."""
+    assert (
+        PyADTPulseAsync._sync_check_response_has_update(response_text, last_value)
+        is expected
+    )
+
+
 # @pytest.mark.asyncio
 # @pytest.mark.parametrize("test_requests", (False, True))
 # @pytest.mark.timeout(60)
@@ -559,54 +587,39 @@ async def test_gateway_offline(
     p.site.gateway.backoff.initial_backoff_interval = FAST_BACKOFF_INTERVAL
     p.site.gateway.backoff._max_backoff_interval = 0.2
     pattern = make_sync_check_pattern(get_mocked_url)
+    num_backoffs = 3
+    # Updates are detected by the sync token *changing* (matching the portal's
+    # own ajaxUpdate.js). The first orb fetch (triggered by a changed token)
+    # reports the gateway OFFLINE; subsequent fetches report it back ONLINE.
     response.get(
         get_mocked_url(ADT_ORB_URI), body=read_file("orb_gateway_offline.html")
     )
-    response.get(
-        pattern,
-        body=DEFAULT_SYNC_CHECK,
-        content_type="text/html",
-    )
-    response.get(
-        pattern,
-        body="1-0-0",
-        content_type="text/html",
-    )
-    response.get(
-        pattern,
-        body=DEFAULT_SYNC_CHECK,
-        content_type="text/html",
-    )
-    response.get(
-        pattern,
-        body=DEFAULT_SYNC_CHECK,
-        content_type="text/html",
-    )
-    num_backoffs = 3
-    for _i in range(3):
-        response.get(
-            pattern,
-            body=DEFAULT_SYNC_CHECK,
-            content_type="text/html",
-        )
-    # success case
     response.get(get_mocked_url(ADT_ORB_URI), body=read_file("orb.html"), repeat=True)
+    # First poll establishes the baseline token (no update signalled).
+    response.get(pattern, body="0-0-0", content_type="text/html")
+    # A changed token drives an update whose orb reports the gateway offline;
+    # the token then stays constant so the offline backoff keeps firing.
+    for _i in range(num_backoffs + 3):
+        response.get(pattern, body="1-0-0", content_type="text/html")
+    # Another changed token drives an update whose orb reports the gateway
+    # back online, ending the offline backoff.
     response.get(
-        pattern,
-        body="1-0-0",
-        content_type="text/html",
-    )
-    response.get(
-        pattern, body=DEFAULT_SYNC_CHECK, content_type="text/html", repeat=True
+        pattern, body=NEXT_SYNC_CHECK, content_type="text/html", repeat=True
     )
     add_logout(response, get_mocked_url, read_file)
     assert p.site.gateway.poll_interval == FAST_POLL_INTERVAL
-    # FIXME: why + 2?
-    for _i in range(num_backoffs + 2):
-        with pytest.raises(PulseGatewayOfflineError):
+    # The gateway is offline; wait_for_update() raises PulseGatewayOfflineError
+    # on each poll until a *changed* sync token drives a successful update that
+    # brings the gateway back online.
+    offline_errors = 0
+    while True:
+        try:
             await p.async_wait_for_update()
-
-    await p.async_wait_for_update()
+            break
+        except PulseGatewayOfflineError:
+            offline_errors += 1
+            assert offline_errors < 20, "gateway never came back online"
+    assert offline_errors >= 1
     assert p.site.gateway.is_online
     assert p.site.gateway.backoff.get_current_backoff_interval() == 0
 

@@ -480,6 +480,34 @@ class PyADTPulseAsync:
             # success, return
             return
 
+    @staticmethod
+    def _sync_check_response_has_update(
+        response_text: str, last_value: str | None
+    ) -> bool:
+        """
+        Determine whether a sync-check token indicates pending updates.
+
+        ADT's sync-check endpoint returns an opaque token like ``1-0-0`` or
+        ``61494-0-0`` whose leading field is a monotonic counter. Updates are
+        signalled by the token *changing* from the previously observed value
+        (this mirrors the portal's own ``lastsynckey != responseText`` check),
+        not by the magnitude of any field.
+
+        Args:
+            response_text (str): the current sync-check token.
+            last_value (str | None): the previously observed token, or None if
+                no token has been observed yet (i.e. the first poll after
+                login), in which case this is treated as the baseline and no
+                update is signalled.
+
+        Returns:
+            bool: True if the token changed from a known previous value.
+
+        """
+        if last_value is None:
+            return False
+        return response_text != last_value
+
     async def _sync_check_task(self) -> None:  # noqa: PLR0912, PLR0915
         """Asynchronous function that performs a synchronization check task."""
 
@@ -497,6 +525,9 @@ class PyADTPulseAsync:
         code: int = 200
         have_updates = False
         url: URL | None = None
+        # The previously seen sync-check token, used for change detection.
+        # Reset for each invocation of the task (i.e. each (re)login).
+        last_sync_check_value: str | None = None
 
         def check_sync_check_response() -> bool:
             """
@@ -516,6 +547,7 @@ class PyADTPulseAsync:
                     if the ADT Pulse site returns a not logged in error.
 
             """
+            nonlocal last_sync_check_value
             if response_text is None:
                 LOG.warning("Internal Error: response_text is None")
                 return False
@@ -534,10 +566,19 @@ class PyADTPulseAsync:
                 finally:
                     LOG.warning(warning_msg)
                 return False
-            split_text = response_text.split("-")
-            if int(split_text[0]) > 9 or int(split_text[1]) > 9:
-                return False
-            return True
+            # ADT returns a sync token such as "1-0-0" or "61494-0-0". The
+            # portal's own ajaxUpdate.js treats this purely as an opaque token
+            # and flags updates whenever it *changes* from the previously seen
+            # value (``lastsynckey != responseText``). The leading field is a
+            # monotonic counter that routinely grows past 9, so inspecting the
+            # magnitude of the fields (the previous approach) silently stopped
+            # detecting updates once the counter got large. Use change
+            # detection to match the portal's behaviour.
+            updated = self._sync_check_response_has_update(
+                response_text, last_sync_check_value
+            )
+            last_sync_check_value = response_text
+            return updated
 
         async def handle_no_updates_exist() -> None:
             if have_updates:
